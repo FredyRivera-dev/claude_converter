@@ -152,7 +152,7 @@ tokens = tokenizer.apply_chat_template(
 ## Fine-tuning local models
 
 Claude Code sessions are a natural source of training data: they capture
-real coding conversations — tool calls, reasoning traces, multi-turn edits —
+real coding conversations (tool calls, reasoning traces, multi-turn edits)
 in a format that maps directly to the `messages` list expected by every major
 fine-tuning framework.
 
@@ -160,12 +160,12 @@ fine-tuning framework.
 
 Before training, filter the messages list for your target model:
 
-- **Strip tool blocks** — most local models don't understand `<tool_use>` /
+- **Strip tool blocks**: most local models don't understand `<tool_use>` /
   `<tool_result>` tags. Remove or replace them unless you are training a
   tool-calling model.
-- **Strip thinking blocks** — `<thinking>` blocks leak chain-of-thought that
+- **Strip thinking blocks**: `<thinking>` blocks leak chain-of-thought that
   may not generalize. Keep them only if you are distilling reasoning behavior.
-- **Drop short or empty turns** — single-word assistant replies and empty
+- **Drop short or empty turns**: single-word assistant replies and empty
   user turns add noise.
 
 ```python
@@ -196,12 +196,11 @@ import glob
 
 MODEL_ID = "your-model-id"
 
-# Load one or more sessions
 all_messages = []
 for path in glob.glob("~/.claude/projects/**/*.jsonl", recursive=True):
     msgs = session_to_messages(path)
     msgs = clean_messages(msgs)
-    if len(msgs) >= 2:           # skip degenerate sessions
+    if len(msgs) >= 2:
         all_messages.append({"messages": msgs})
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
