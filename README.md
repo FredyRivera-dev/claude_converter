@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./images/claude_converter.png" alt="Logo" width="800"/>
+<img src="https://res.cloudinary.com/dmtomxyvm/image/upload/v1782600964/claude_converter_uattyw.png" alt="Logo" width="800"/>
 
 </div>
 
@@ -99,7 +99,11 @@ inspect_session("session.jsonl", show_flow=True, show_blocks=True, show_raw=True
 
 Example output (default):
 
-<img src="./images/example.png" alt="Logo" width="750"/>
+<div align="center">
+
+<img src="https://res.cloudinary.com/dmtomxyvm/image/upload/v1782600981/example_g302zu.png" alt="Logo" width="750"/>
+
+</div>
 
 ## Using the output with Transformers
 
