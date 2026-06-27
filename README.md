@@ -1,4 +1,10 @@
-# claude_converter
+<div align="center">
+
+# Claude-Converter
+
+<img src="./images/claude_converter.png" alt="Logo" width="800"/>
+
+</div>
 
 A zero-dependency Python module for inspecting and converting [Claude Code](https://www.anthropic.com/claude-code) session files (`.jsonl`) into the `messages` format expected by Hugging Face Transformers.
 
@@ -95,39 +101,7 @@ inspect_session("session.jsonl", show_flow=True, show_blocks=True, show_raw=True
 
 Example output (default):
 
-```
-══════════════════════════════════════════════════════════════════════
-  CLAUDE CODE SESSION INSPECTOR
-══════════════════════════════════════════════════════════════════════
-  File    : session.jsonl
-  Size    : 3.6 KB
-  Lines   : 9
-  Session : abc-123
-  CWD     : /home/user/myproject
-  Branch  : main
-══════════════════════════════════════════════════════════════════════
-
-  RECORD TYPES
-  user         4  ████
-  assistant    4  ████
-  system       1  █
-
-  CONTENT BLOCKS (by record type)
-  assistant
-    · text                 3
-    · tool_use             2
-    · thinking             1
-  user
-    · text                 2
-    · tool_result          2
-
-  TOKEN USAGE
-  Input       : 2,617
-  Output      : 147
-  Cache read  : 1,700
-  Cache write :   482
-  Total       : 2,764
-```
+<img src="./images/example.png" alt="Logo" width="800"/>
 
 ## Using the output with Transformers
 
