@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-converter"
-version = "1.0.0"
-description = "A zero-dependency Python module for inspecting and converting Claude Code session files '.jsonl' into the 'messages' format expected by Hugging Face Transformers."
+version = "1.2.0"
+description = "A zero-dependency Python module for inspecting and converting Claude Code session files (.jsonl) into the messages format expected by Hugging Face Transformers."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "Apache License 2.0"}
@@ -15,7 +15,14 @@ authors = [
 keywords = [
     "ai",
     "claude",
-    "transformers"
+    "transformers",
+    "python",
+    "dataset",
+    "claude-code",
+    "fine-tuning",
+    "llm",
+    "messages",
+    "jsonl"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
