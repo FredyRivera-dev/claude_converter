@@ -1,7 +1,5 @@
 <div align="center">
 
-# Claude-Converter
-
 <img src="./images/claude_converter.png" alt="Logo" width="800"/>
 
 </div>
@@ -101,7 +99,7 @@ inspect_session("session.jsonl", show_flow=True, show_blocks=True, show_raw=True
 
 Example output (default):
 
-<img src="./images/example.png" alt="Logo" width="800"/>
+<img src="./images/example.png" alt="Logo" width="750"/>
 
 ## Using the output with Transformers
 
