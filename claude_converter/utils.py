@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+import json
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+CYAN    = "\033[36m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+RED     = "\033[31m"
+MAGENTA = "\033[35m"
+
+DEFAULT_ROLE_COLORS = {"user": GREEN, "assistant": CYAN, "system": YELLOW}
+
+
+def _c(text: object, *codes: str) -> str:
+    return "".join(codes) + str(text) + RESET
+
+
+def _hr(char: str = "-", width: int = 70) -> str:
+    return _c(char * width, DIM)
+
+
+def _truncate(text: object, max_len: int = 120) -> str:
+    text = str(text).replace("\n", "\\n")
+    return text[:max_len] + _c("...", DIM) if len(text) > max_len else text
+
+
+def load_jsonl(path: str | Path) -> list[dict]:
+    """
+    Load any newline-delimited JSON session file into a list of dicts.
+
+    This loader is format-agnostic: it does not know anything about
+    Claude Code, Codex, or Pi. Each tool-specific converter is responsible
+    for interpreting the records it returns.
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+        ValueError: if the extension is not .jsonl/.json, or the file has
+                    no valid records.
+    """
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    if path.suffix not in (".jsonl", ".json"):
+        raise ValueError(f"Unrecognized extension: {path.suffix}. Expected .jsonl or .json")
+
+    records: list[dict] = []
+
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(f"X Line {i} is invalid JSON: {e}")
+
+    if not records:
+        raise ValueError("File is empty or contains no valid records.")
+
+    return records
+
+
+@dataclass
+class InspectorSchema:
+    """
+    Describes how to pull generic fields out of a tool-specific record,
+    so the same report/printing logic can be reused for any converter.
+
+    Attributes:
+        label:           Display name for the report header (e.g. "CODEX").
+        record_type_of:  Returns a display label for the record's raw type.
+        is_message:      Whether a record represents a conversation turn.
+        role_of:         Returns the turn's role (user/assistant/etc.).
+        text_of:         Flattens a record's content to plain text.
+        timestamp_of:    Returns a short display timestamp.
+        role_colors:     Maps role -> ANSI color.
+        total_tokens_of: Optional; computes a token-usage summary dict
+                         from the full record list.
+    """
+
+    label: str
+    record_type_of: Callable[[dict], str]
+    is_message: Callable[[dict], bool]
+    role_of: Callable[[dict], str]
+    text_of: Callable[[dict], str]
+    timestamp_of: Callable[[dict], str] = lambda r: ""
+    role_colors: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_COLORS))
+    total_tokens_of: Optional[Callable[[list[dict]], dict[str, int]]] = None
+
+
+def print_header(path: Path, records: list[dict], schema: InspectorSchema) -> None:
+    print()
+    print(_hr("="))
+    print(_c(f"  {schema.label} SESSION INSPECTOR", BOLD + CYAN))
+    print(_hr("="))
+    print(f"  File  : {_c(str(path), BOLD)}")
+    print(f"  Size  : {_c(f'{path.stat().st_size / 1024:.1f} KB', BOLD)}")
+    print(f"  Lines : {_c(len(records), BOLD)}")
+    print(_hr("="))
+
+
+def _scaled_bar(count: int, max_count: int, width: int = 40) -> str:
+    """Bar length proportional to the largest count in the set, not a fixed cap."""
+    if max_count <= 0:
+        return ""
+    length = max(1, round((count / max_count) * width))
+    return "█" * length
+
+
+def print_record_types(records: list[dict], schema: InspectorSchema) -> None:
+    print()
+    print(_c("  RECORD TYPES", BOLD))
+    print(_hr())
+
+    counts = Counter(schema.record_type_of(r) for r in records)
+    max_count = counts.most_common(1)[0][1] if counts else 0
+    for rtype, count in counts.most_common():
+        bar = _scaled_bar(count, max_count)
+        print(f"  {rtype.ljust(28)} {_c(count, BOLD):>4}  {_c(bar, DIM)}")
+
+
+def print_message_roles(records: list[dict], schema: InspectorSchema) -> None:
+    messages = [r for r in records if schema.is_message(r)]
+    if not messages:
+        return
+
+    print()
+    print(_c("  MESSAGE ROLES", BOLD))
+    print(_hr())
+
+    counts = Counter(schema.role_of(r) for r in messages)
+    max_count = counts.most_common(1)[0][1] if counts else 0
+    for role, count in counts.most_common():
+        cf = schema.role_colors.get(role, DIM)
+        bar = _scaled_bar(count, max_count)
+        print(f"  {_c(role.ljust(12), cf)} {_c(count, BOLD):>4}  {_c(bar, cf)}")
+
+
+def print_token_usage(records: list[dict], schema: InspectorSchema) -> None:
+    if schema.total_tokens_of is None:
+        return
+
+    totals = schema.total_tokens_of(records)
+    if not totals:
+        return
+
+    print()
+    print(_c("  TOKEN USAGE", BOLD))
+    print(_hr())
+    for key, value in totals.items():
+        label = key.replace("_", " ").title().ljust(20)
+        print(f"  {label} {_c(f'{value:,}', BOLD)}")
+
+
+def print_flow(records: list[dict], schema: InspectorSchema, show_text: bool = False) -> None:
+    messages = [r for r in records if schema.is_message(r)]
+    if not messages:
+        return
+
+    print()
+    print(_c("  CONVERSATION FLOW", BOLD))
+    print(_hr())
+
+    for i, r in enumerate(messages):
+        role = schema.role_of(r)
+        cf = schema.role_colors.get(role, DIM)
+        ts = schema.timestamp_of(r)
+        print(f"  {i + 1:>3}. {_c(f'[{role.upper()}]'.ljust(14), cf + BOLD)} {_c(ts, DIM)}")
+        if show_text:
+            print(f"       {_truncate(schema.text_of(r), 200)}")
+        print()
+
+
+def run_inspection(
+    path: str | Path,
+    records: list[dict],
+    schema: InspectorSchema,
+    show_flow: bool = False,
+    show_blocks: bool = False,
+) -> None:
+    """
+    Generic inspection report, usable by any converter that provides an
+    InspectorSchema. show_blocks only takes effect when show_flow is True.
+    """
+    path = Path(path)
+
+    print_header(path, records, schema)
+    print_record_types(records, schema)
+    print_message_roles(records, schema)
+    print_token_usage(records, schema)
+
+    if show_flow:
+        print_flow(records, schema, show_text=show_blocks)
+
+    print(_hr("="))
+    print()
