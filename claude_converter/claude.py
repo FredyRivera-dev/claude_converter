@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
-from claude_converter.utils import (
+from .utils import (
     BOLD,
     CYAN,
     DIM,
@@ -15,10 +16,14 @@ from claude_converter.utils import (
     _c,
     _hr,
     _truncate,
+    convert_base64_to_pil_image,
+    finalize_content,
     load_jsonl,
+    merge_content_parts,
     run_inspection,
 )
 
+# ── parseo especifico de Claude Code (unico contenido no compartible) ──
 
 def _block_to_str(block: dict) -> str:
     """Flatten a single content block to plain text."""
@@ -43,7 +48,53 @@ def _block_to_str(block: dict) -> str:
             )
         return f"<tool_result>{content}</tool_result>"
 
+    if btype == "image":
+        return "<image>"
+
     return ""
+
+
+def _decode_claude_image(block: dict):
+    """
+    Decode a Claude Code image block:
+    {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+
+    Returns None (with a stderr warning) instead of raising, for two
+    known real-world cases: a documented Claude Code bug where
+    source.data arrives as an empty string over remote control, and
+    plain corrupted/undecodable base64.
+    """
+    source = block.get("source", {})
+    if source.get("type") != "base64":
+        print(f"X Skipping image with unsupported source type: {source.get('type')!r}", file=sys.stderr)
+        return None
+
+    data = source.get("data", "")
+    if not data:
+        print("X Skipping image block with empty base64 data", file=sys.stderr)
+        return None
+
+    try:
+        return convert_base64_to_pil_image(data)
+    except (ImportError, ValueError) as e:
+        print(f"X Skipping unreadable image block: {e}", file=sys.stderr)
+        return None
+
+
+def _block_to_parts(block: dict) -> dict | None:
+    """
+    Like _block_to_str, but keeps an image block as a distinct multimodal
+    part {"type": "image", "image": PIL.Image} instead of flattening it
+    into text. Returns None for empty/unsupported/undecodable blocks.
+    """
+    btype = block.get("type", "")
+
+    if btype == "image":
+        image = _decode_claude_image(block)
+        return {"type": "image", "image": image} if image is not None else None
+
+    text = _block_to_str(block)
+    return {"type": "text", "text": text} if text.strip() else None
 
 
 def _content_to_str(content: str | list | None) -> str:
@@ -56,6 +107,21 @@ def _content_to_str(content: str | list | None) -> str:
     return ""
 
 
+def _content_to_parts(content: str | list | None) -> list[dict]:
+    """
+    Like _content_to_str, but keeps text and image blocks as separate
+    multimodal content parts (the `transformers` chat-template format:
+    [{"type": "text", "text": ...}, {"type": "image", "image": PIL.Image}])
+    instead of flattening everything into one string.
+    """
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content.strip() else []
+    if isinstance(content, list):
+        parts = [_block_to_parts(b) for b in content if isinstance(b, dict)]
+        return [p for p in parts if p is not None]
+    return []
+
+
 def _collect_block_types(content: str | list | None) -> list[str]:
     if isinstance(content, str):
         return ["raw_string"]
@@ -66,7 +132,7 @@ def _collect_block_types(content: str | list | None) -> list[str]:
 
 def _render_block(block: dict, indent: str = "       ") -> str:
     btype = block.get("type", "?")
-    block_colors = {"text": GREEN, "thinking": MAGENTA, "tool_use": YELLOW, "tool_result": CYAN}
+    block_colors = {"text": GREEN, "thinking": MAGENTA, "tool_use": YELLOW, "tool_result": CYAN, "image": BOLD + CYAN}
     cf = block_colors.get(btype, RED)
     lines = []
 
@@ -87,6 +153,11 @@ def _render_block(block: dict, indent: str = "       ") -> str:
             content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
         lines.append(f"{indent}{_c('tool_result', cf)}: [{_c(block.get('tool_use_id', '?'), DIM)}]")
         lines.append(f"{indent}  content: {_truncate(str(content), 120)}")
+
+    elif btype == "image":
+        source = block.get("source", {})
+        data_len = len(source.get("data", "") or "")
+        lines.append(f"{indent}{_c('image', cf)}: {source.get('media_type', '?')} ({data_len} base64 chars)")
 
     else:
         lines.append(f"{indent}{_c(btype, RED)}: {_truncate(str(block), 100)}")
@@ -117,10 +188,14 @@ def load_session(path: str | Path) -> list[dict]:
 def records_to_messages(records: list[dict]) -> list[dict]:
     """
     Convert a list of Claude Code session records to the Transformers messages format:
-    [{"role": "user" | "assistant", "content": str}, ...]
+    [{"role": "user" | "assistant", "content": str | list[dict]}, ...]
 
-    System records are skipped. Content blocks (tool_use, tool_result, thinking)
-    are flattened to plain text using XML-style tags.
+    System records are skipped. Text, thinking, tool_use and tool_result
+    blocks are flattened to plain text using XML-style tags. Image blocks
+    are kept as separate multimodal parts (e.g. [{"type": "text", ...},
+    {"type": "image", "image": PIL.Image}]) instead of being dropped;
+    messages with no images keep the plain string "content" format used
+    before multimodal support existed.
 
     Args:
         records: List of records returned by load_session().
@@ -128,7 +203,7 @@ def records_to_messages(records: list[dict]) -> list[dict]:
     Returns:
         List of dicts with "role" and "content" keys.
     """
-    messages: list[dict] = []
+    turns: list[dict] = []  # [{"role": ..., "parts": [...]}]
 
     for record in records:
         rtype = record.get("type")
@@ -137,15 +212,17 @@ def records_to_messages(records: list[dict]) -> list[dict]:
 
         msg = record.get("message", {})
         role = msg.get("role", rtype)
-        content = msg.get("content", "")
-        text = _content_to_str(content)
+        parts = _content_to_parts(msg.get("content", ""))
 
-        if not text.strip():
+        if not parts:
             continue
 
-        messages.append({"role": role, "content": text})
+        if turns and turns[-1]["role"] == role:
+            merge_content_parts(turns[-1]["parts"], parts)
+        else:
+            turns.append({"role": role, "parts": list(parts)})
 
-    return messages
+    return [{"role": t["role"], "content": finalize_content(t["parts"])} for t in turns]
 
 
 def session_to_messages(

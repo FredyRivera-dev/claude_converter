@@ -104,6 +104,34 @@ def convert_base64_to_pil_image(uri: str):
         raise ValueError(f"Could not decode base64 image: {e}") from e
 
 
+def merge_content_parts(existing: list[dict], new: list[dict]) -> None:
+    """
+    Extend `existing` in place with `new` multimodal content parts,
+    joining adjacent text parts instead of leaving separate fragments.
+    Shared by every converter's records_to_messages_*, since "merge
+    consecutive same-role turns" is the same operation regardless of
+    which tool produced the session.
+    """
+    for part in new:
+        if existing and existing[-1]["type"] == "text" and part["type"] == "text":
+            existing[-1] = {"type": "text", "text": existing[-1]["text"] + "\n" + part["text"]}
+        else:
+            existing.append(dict(part))
+
+
+def finalize_content(parts: list[dict]) -> str | list[dict]:
+    """
+    Collapse a parts list to a plain string when there are no images, so
+    text-only turns keep the exact "content": str shape used before
+    multimodal support existed. Only keep the list-of-parts form (the
+    shape `transformers` multimodal chat templates expect) when at least
+    one non-text part (an image) is present.
+    """
+    if all(p["type"] == "text" for p in parts):
+        return "\n".join(p["text"] for p in parts)
+    return parts
+
+
 @dataclass
 class InspectorSchema:
     """

@@ -7,7 +7,9 @@ from pathlib import Path
 from claude_converter.utils import (
     InspectorSchema,
     convert_base64_to_pil_image,
+    finalize_content,
     load_jsonl,
+    merge_content_parts,
     run_inspection,
 )
 
@@ -136,28 +138,6 @@ def _payload_parts(payload: dict) -> list[dict]:
     return [{"type": "text", "text": text}] if text.strip() else []
 
 
-def _merge_parts(existing: list[dict], new: list[dict]) -> None:
-    """Extend `existing` in place with `new`, joining adjacent text parts
-    instead of leaving them as separate fragments."""
-    for part in new:
-        if existing and existing[-1]["type"] == "text" and part["type"] == "text":
-            existing[-1] = {"type": "text", "text": existing[-1]["text"] + "\n" + part["text"]}
-        else:
-            existing.append(dict(part))
-
-
-def _finalize_content(parts: list[dict]) -> str | list[dict]:
-    """
-    Collapse to a plain string when a message has no images, so text-only
-    conversations keep the exact same "content": str format as before.
-    Keep the list-of-parts form only when at least one image is present,
-    since that's the shape `transformers` multimodal chat templates expect.
-    """
-    if all(p["type"] == "text" for p in parts):
-        return "\n".join(p["text"] for p in parts)
-    return parts
-
-
 def records_to_messages_codex(records: list[dict]) -> list[dict]:
     """
     Convert Codex session records to the Transformers messages format:
@@ -183,11 +163,11 @@ def records_to_messages_codex(records: list[dict]) -> list[dict]:
             continue
 
         if turns and turns[-1]["role"] == role:
-            _merge_parts(turns[-1]["parts"], parts)
+            merge_content_parts(turns[-1]["parts"], parts)
         else:
             turns.append({"role": role, "parts": list(parts)})
 
-    return [{"role": t["role"], "content": _finalize_content(t["parts"])} for t in turns]
+    return [{"role": t["role"], "content": finalize_content(t["parts"])} for t in turns]
 
 
 def session_to_messages_codex(

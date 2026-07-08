@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
-from claude_converter.utils import InspectorSchema, load_jsonl, run_inspection
+from claude_converter.utils import (
+    InspectorSchema,
+    convert_base64_to_pil_image,
+    finalize_content,
+    load_jsonl,
+    merge_content_parts,
+    run_inspection,
+)
 
 
 def load_session_pi(path: str | Path) -> list[dict]:
@@ -31,7 +39,27 @@ def _block_to_text(block: dict) -> str:
         args = json.dumps(block.get("arguments", {}), ensure_ascii=False)
         return f"<tool_use name='{name}'>{args}</tool_use>"
 
+    if btype == "image":
+        return "<image>"
+
     return ""
+
+
+def _decode_pi_image(block: dict):
+    """
+    Decode a Pi image content block: {"type": "image", "data": "<base64>",
+    "mimeType": "image/png"}. Returns None (with a stderr warning) instead
+    of raising on empty or undecodable base64.
+    """
+    data = block.get("data", "")
+    if not data:
+        print("X Skipping image block with empty base64 data", file=sys.stderr)
+        return None
+    try:
+        return convert_base64_to_pil_image(data)
+    except (ImportError, ValueError) as e:
+        print(f"X Skipping unreadable image block: {e}", file=sys.stderr)
+        return None
 
 
 def _message_of(record: dict) -> dict | None:
@@ -57,11 +85,14 @@ def _text_of(record: dict) -> str:
 
     if role == "toolResult":
         content = message.get("content", [])
-        parts = [
-            b.get("text", "")
-            for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        ]
+        parts = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif b.get("type") == "image":
+                parts.append("<image>")
         text = "\n".join(p for p in parts if p.strip())
         tool_name = message.get("toolName", "")
         tool_id = message.get("toolCallId", "")
@@ -76,32 +107,83 @@ def _text_of(record: dict) -> str:
     return ""
 
 
+def _message_parts(record: dict) -> list[dict]:
+    """
+    Like _text_of, but keeps text and image blocks as separate multimodal
+    content parts (the `transformers` chat-template format) instead of
+    flattening everything into one string. Both plain user/assistant
+    messages and toolResult content can carry ImageContent per Pi's
+    session format.
+    """
+    message = _message_of(record) or {}
+    role = message.get("role", "")
+
+    if role == "toolResult":
+        tool_name = message.get("toolName", "")
+        tool_id = message.get("toolCallId", "")
+        parts: list[dict] = [{"type": "text", "text": f"<tool_result name='{tool_name}' id='{tool_id}'>"}]
+
+        for b in message.get("content", []):
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and b.get("text", "").strip():
+                parts.append({"type": "text", "text": b["text"]})
+            elif b.get("type") == "image":
+                image = _decode_pi_image(b)
+                if image is not None:
+                    parts.append({"type": "image", "image": image})
+
+        parts.append({"type": "text", "text": "</tool_result>"})
+        return parts
+
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content.strip() else []
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "image":
+                image = _decode_pi_image(b)
+                if image is not None:
+                    parts.append({"type": "image", "image": image})
+            else:
+                text = _block_to_text(b)
+                if text.strip():
+                    parts.append({"type": "text", "text": text})
+        return parts
+    return []
+
+
 def records_to_messages_pi(records: list[dict]) -> list[dict]:
     """
     Convert Pi session records to the Transformers messages format:
-    [{"role": "user" | "assistant", "content": str}, ...]
+    [{"role": "user" | "assistant", "content": str | list[dict]}, ...]
 
     Tool calls and tool results are flattened with XML-style tags, and
     consecutive records that resolve to the same role are merged so
-    roles alternate cleanly.
+    roles alternate cleanly. Image content (in user/assistant messages
+    or in toolResult content) is kept as a multimodal part instead of
+    being dropped; text-only turns keep the plain string content format.
     """
-    messages: list[dict] = []
+    turns: list[dict] = []  # [{"role": ..., "parts": [...]}]
 
     for record in records:
         role = _record_role(record)
         if role is None:
             continue
 
-        text = _text_of(record)
-        if not text.strip():
+        parts = _message_parts(record)
+        if not parts:
             continue
 
-        if messages and messages[-1]["role"] == role:
-            messages[-1]["content"] += "\n" + text
+        if turns and turns[-1]["role"] == role:
+            merge_content_parts(turns[-1]["parts"], parts)
         else:
-            messages.append({"role": role, "content": text})
+            turns.append({"role": role, "parts": list(parts)})
 
-    return messages
+    return [{"role": t["role"], "content": finalize_content(t["parts"])} for t in turns]
 
 
 def session_to_messages_pi(
