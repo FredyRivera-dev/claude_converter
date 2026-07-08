@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -62,12 +65,43 @@ def load_jsonl(path: str | Path) -> list[dict]:
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"X Line {i} is invalid JSON: {e}")
+                print(f"X Line {i} is invalid JSON: {e}", file=sys.stderr)
 
     if not records:
         raise ValueError("File is empty or contains no valid records.")
 
     return records
+
+
+def convert_base64_to_pil_image(uri: str):
+    """
+    Decode a base64 image (a bare base64 string, or a data URI like
+    "data:image/png;base64,....") into a PIL.Image.Image, ready to drop
+    into a `transformers` multimodal content part:
+        {"type": "image", "image": convert_base64_to_pil_image(uri)}
+
+    Pillow is imported lazily here, not at module level: this package is
+    otherwise zero-dependency, and most sessions never touch images, so
+    importing `claude_converter` shouldn't require installing Pillow.
+
+    Raises:
+        ImportError: if Pillow is not installed.
+        ValueError:  if the payload isn't a decodable image.
+    """
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError(
+            "Pillow is required to decode embedded images. "
+            "Install it with: pip install claude-converter[images]"
+        ) from e
+
+    b64 = uri.split(",", 1)[1] if "," in uri else uri
+
+    try:
+        return Image.open(BytesIO(base64.b64decode(b64)))
+    except Exception as e:
+        raise ValueError(f"Could not decode base64 image: {e}") from e
 
 
 @dataclass
@@ -86,6 +120,15 @@ class InspectorSchema:
         role_colors:     Maps role -> ANSI color.
         total_tokens_of: Optional; computes a token-usage summary dict
                          from the full record list.
+        block_types_of:  Optional; returns the list of content-block type
+                         names for a record (e.g. ["text", "tool_use"]).
+                         Enables the per-role block-type breakdown report.
+        blocks_of:       Optional; returns the raw content blocks for a
+                         record. Enables inline block-by-block rendering
+                         in the conversation flow (show_blocks=True).
+        render_block:    Optional; renders a single raw block to a
+                         colored, indented display string. Required
+                         together with blocks_of for inline rendering.
     """
 
     label: str
@@ -96,6 +139,10 @@ class InspectorSchema:
     timestamp_of: Callable[[dict], str] = lambda r: ""
     role_colors: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_COLORS))
     total_tokens_of: Optional[Callable[[list[dict]], dict[str, int]]] = None
+    tokens_of: Optional[Callable[[dict], int]] = None
+    block_types_of: Optional[Callable[[dict], list[str]]] = None
+    blocks_of: Optional[Callable[[dict], list[dict]]] = None
+    render_block: Optional[Callable[[dict], str]] = None
 
 
 def print_header(path: Path, records: list[dict], schema: InspectorSchema) -> None:
@@ -106,7 +153,6 @@ def print_header(path: Path, records: list[dict], schema: InspectorSchema) -> No
     print(f"  File  : {_c(str(path), BOLD)}")
     print(f"  Size  : {_c(f'{path.stat().st_size / 1024:.1f} KB', BOLD)}")
     print(f"  Lines : {_c(len(records), BOLD)}")
-    print(_hr("="))
 
 
 def _scaled_bar(count: int, max_count: int, width: int = 40) -> str:
@@ -125,8 +171,41 @@ def print_record_types(records: list[dict], schema: InspectorSchema) -> None:
     counts = Counter(schema.record_type_of(r) for r in records)
     max_count = counts.most_common(1)[0][1] if counts else 0
     for rtype, count in counts.most_common():
+        cf = schema.role_colors.get(rtype, DIM)
         bar = _scaled_bar(count, max_count)
-        print(f"  {rtype.ljust(28)} {_c(count, BOLD):>4}  {_c(bar, DIM)}")
+        print(f"  {_c(rtype.ljust(28), cf)} {_c(count, BOLD):>4}  {_c(bar, cf)}")
+
+
+def print_block_summary(records: list[dict], schema: InspectorSchema) -> None:
+    """
+    Content-block breakdown per role (e.g. how many 'text' vs 'tool_use'
+    blocks each role produced). No-op if the schema doesn't provide
+    block_types_of, since not every format exposes nested content blocks.
+    """
+    if schema.block_types_of is None:
+        return
+
+    by_role: dict[str, Counter] = {}
+    for r in records:
+        role = schema.role_of(r) if schema.is_message(r) else schema.record_type_of(r)
+        counter = by_role.setdefault(role, Counter())
+        for btype in schema.block_types_of(r):
+            counter[btype] += 1
+
+    if not by_role:
+        return
+
+    print()
+    print(_c("  CONTENT BLOCKS (by record type)", BOLD))
+    print(_hr())
+
+    for role, counter in sorted(by_role.items()):
+        if not counter:
+            continue
+        cf = schema.role_colors.get(role, DIM)
+        print(f"  {_c(role, cf + BOLD)}")
+        for btype, cnt in counter.most_common():
+            print(f"    {_c('·', DIM)} {btype.ljust(20)} {_c(cnt, BOLD)}")
 
 
 def print_message_roles(records: list[dict], schema: InspectorSchema) -> None:
@@ -171,14 +250,53 @@ def print_flow(records: list[dict], schema: InspectorSchema, show_text: bool = F
     print(_c("  CONVERSATION FLOW", BOLD))
     print(_hr())
 
+    can_render_blocks = schema.blocks_of is not None and schema.render_block is not None
+
     for i, r in enumerate(messages):
         role = schema.role_of(r)
         cf = schema.role_colors.get(role, DIM)
         ts = schema.timestamp_of(r)
-        print(f"  {i + 1:>3}. {_c(f'[{role.upper()}]'.ljust(14), cf + BOLD)} {_c(ts, DIM)}")
-        if show_text:
+        tk_label = ""
+        if schema.tokens_of is not None:
+            tokens = schema.tokens_of(r)
+            tk_label = _c(f"{tokens}tk", DIM) if tokens else ""
+
+        print(f"  {i + 1:>3}. {_c(f'[{role.upper()}]'.ljust(14), cf + BOLD)} {_c(ts, DIM)} {tk_label}")
+
+        if schema.block_types_of is not None:
+            print(f"       {_c('blocks: ' + ', '.join(schema.block_types_of(r)), DIM)}")
+
+        if show_text and can_render_blocks:
+            for block in schema.blocks_of(r):
+                print(schema.render_block(block))
+        elif show_text:
             print(f"       {_truncate(schema.text_of(r), 200)}")
+
         print()
+
+
+def print_raw_examples(records: list[dict], schema: InspectorSchema) -> None:
+    """One raw record example per record type found, format-agnostic."""
+    print()
+    print(_c("  RAW RECORD EXAMPLES (one per type)", BOLD))
+    print(_hr())
+
+    seen: set[str] = set()
+    for r in records:
+        rtype = schema.record_type_of(r)
+        if rtype in seen:
+            continue
+        seen.add(rtype)
+
+        print(_c(f"  type = {rtype}", BOLD + YELLOW))
+        print(_c("  top-level keys:", DIM))
+        print(f"    {_c(list(r.keys()), DIM)}")
+
+        if schema.is_message(r):
+            print(_c("  flattened text:", DIM))
+            print(f"    {_truncate(schema.text_of(r), 150)}")
+
+        print(_hr("."))
 
 
 def run_inspection(
@@ -187,15 +305,25 @@ def run_inspection(
     schema: InspectorSchema,
     show_flow: bool = False,
     show_blocks: bool = False,
+    extra_header: Optional[Callable[[list[dict]], None]] = None,
 ) -> None:
     """
     Generic inspection report, usable by any converter that provides an
     InspectorSchema. show_blocks only takes effect when show_flow is True.
+
+    extra_header: optional callback invoked right after the header block,
+    for format-specific metadata (e.g. Claude Code's sessionId/cwd/branch)
+    that doesn't generalize across formats.
     """
     path = Path(path)
 
     print_header(path, records, schema)
+    if extra_header is not None:
+        extra_header(records)
+    print(_hr("="))
+
     print_record_types(records, schema)
+    print_block_summary(records, schema)
     print_message_roles(records, schema)
     print_token_usage(records, schema)
 

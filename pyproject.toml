@@ -43,6 +43,9 @@ dev = [
     "isort",
     "mypy",
 ]
+images = [
+    "Pillow",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/FredyRivera-dev/claude_converter"
