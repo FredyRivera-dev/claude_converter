@@ -132,6 +132,33 @@ def finalize_content(parts: list[dict]) -> str | list[dict]:
     return parts
 
 
+def dget(d: object, key: str) -> dict:
+    """
+    Safe "get a nested dict" accessor. Like `d.get(key, {})`, but also
+    falls back to {} when the key is *present* with an explicit `null`,
+    since dict.get's default only kicks in when the key is absent.
+
+    Real coding-agent session JSONL files have fields that are sometimes
+    an object and sometimes null depending on the event type (observed in
+    the wild: a Codex token_count event with "info": null, which crashed
+    with AttributeError: 'NoneType' object has no attribute 'get'). This
+    guards every chained `.get(...).get(...)` against that failure mode.
+    """
+    if not isinstance(d, dict):
+        return {}
+    value = d.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def dlist(d: object, key: str) -> list:
+    """Same idea as dget, but for fields expected to be a list (falls
+    back to [] on an explicit null, a missing key, or a non-dict parent)."""
+    if not isinstance(d, dict):
+        return []
+    value = d.get(key)
+    return value if isinstance(value, list) else []
+
+
 @dataclass
 class InspectorSchema:
     """

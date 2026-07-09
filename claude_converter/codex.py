@@ -7,6 +7,8 @@ from pathlib import Path
 from claude_converter.utils import (
     InspectorSchema,
     convert_base64_to_pil_image,
+    dget,
+    dlist,
     finalize_content,
     load_jsonl,
     merge_content_parts,
@@ -41,7 +43,7 @@ def _payload_text(payload: dict) -> str:
 
     if ptype == "message":
         parts = []
-        for block in payload.get("content", []):
+        for block in dlist(payload, "content"):
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
@@ -54,7 +56,7 @@ def _payload_text(payload: dict) -> str:
     if ptype == "reasoning":
         parts = [
             s.get("text", "")
-            for s in payload.get("summary", [])
+            for s in dlist(payload, "summary")
             if isinstance(s, dict)
         ]
         text = "\n".join(p for p in parts if p.strip())
@@ -84,7 +86,7 @@ def _record_role(record: dict) -> str | None:
     if record.get("type") != "response_item":
         return None
 
-    payload = record.get("payload", {})
+    payload = dget(record, "payload")
     ptype = payload.get("type", "")
 
     if ptype == "message":
@@ -111,7 +113,7 @@ def _payload_parts(payload: dict) -> list[dict]:
 
     if ptype == "message":
         parts: list[dict] = []
-        for block in payload.get("content", []):
+        for block in dlist(payload, "content"):
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
@@ -158,7 +160,7 @@ def records_to_messages_codex(records: list[dict]) -> list[dict]:
         if role is None:
             continue
 
-        parts = _payload_parts(record.get("payload", {}))
+        parts = _payload_parts(dget(record, "payload"))
         if not parts:
             continue
 
@@ -191,8 +193,8 @@ def session_to_messages_codex(
 
 def _record_type_of(record: dict) -> str:
     rtype = record.get("type", "unknown")
-    payload = record.get("payload", {})
-    sub = payload.get("type") if isinstance(payload, dict) else None
+    payload = dget(record, "payload")
+    sub = payload.get("type")
     return f"{rtype}:{sub}" if sub else rtype
 
 
@@ -204,13 +206,19 @@ def _total_tokens_of(records: list[dict]) -> dict[str, int]:
     """Codex reports cumulative usage, so keep the latest snapshot, not a sum."""
     latest: dict = {}
     for r in records:
-        payload = r.get("payload", {})
-        if isinstance(payload, dict) and payload.get("type") == "token_count":
-            usage = payload.get("info", {}).get("total_token_usage")
+        payload = dget(r, "payload")
+        if payload.get("type") == "token_count":
+            # `payload.get("info", {})` is not enough: some token_count events
+            # carry "info": null explicitly, and dict.get's default only
+            # applies when the key is *absent*, not when it's present with
+            # value None. Same reasoning for "total_token_usage" below.
+            info = dget(payload, "info")
+            usage = info.get("total_token_usage") or None
             if usage:
                 latest = usage
     if not latest:
         return {}
+
     return {
         "input_tokens": latest.get("input_tokens", 0),
         "output_tokens": latest.get("output_tokens", 0),
@@ -224,7 +232,7 @@ CODEX_SCHEMA = InspectorSchema(
     record_type_of=_record_type_of,
     is_message=lambda r: _record_role(r) is not None,
     role_of=lambda r: _record_role(r) or "other",
-    text_of=lambda r: _payload_text(r.get("payload", {})),
+    text_of=lambda r: _payload_text(dget(r, "payload")),
     timestamp_of=_timestamp_of,
     total_tokens_of=_total_tokens_of,
 )

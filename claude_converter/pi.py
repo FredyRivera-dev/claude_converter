@@ -7,6 +7,8 @@ from pathlib import Path
 from claude_converter.utils import (
     InspectorSchema,
     convert_base64_to_pil_image,
+    dget,
+    dlist,
     finalize_content,
     load_jsonl,
     merge_content_parts,
@@ -65,7 +67,7 @@ def _decode_pi_image(block: dict):
 def _message_of(record: dict) -> dict | None:
     if record.get("type") != "message":
         return None
-    return record.get("message", {})
+    return dget(record, "message")
 
 
 def _record_role(record: dict) -> str | None:
@@ -84,9 +86,8 @@ def _text_of(record: dict) -> str:
     role = message.get("role", "")
 
     if role == "toolResult":
-        content = message.get("content", [])
         parts = []
-        for b in content:
+        for b in dlist(message, "content"):
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text":
@@ -123,7 +124,7 @@ def _message_parts(record: dict) -> list[dict]:
         tool_id = message.get("toolCallId", "")
         parts: list[dict] = [{"type": "text", "text": f"<tool_result name='{tool_name}' id='{tool_id}'>"}]
 
-        for b in message.get("content", []):
+        for b in dlist(message, "content"):
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text" and b.get("text", "").strip():
@@ -208,7 +209,7 @@ def session_to_messages_pi(
 def _record_type_of(record: dict) -> str:
     rtype = record.get("type", "unknown")
     if rtype == "message":
-        role = record.get("message", {}).get("role", "unknown")
+        role = dget(record, "message").get("role", "unknown")
         return f"message:{role}"
     return rtype
 
@@ -224,7 +225,7 @@ def _total_tokens_of(records: list[dict]) -> dict[str, int]:
     for r in records:
         if r.get("type") != "message":
             continue
-        usage = r.get("message", {}).get("usage")
+        usage = dget(r, "message").get("usage")
         if not usage:
             continue
         found = True
