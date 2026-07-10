@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-converter"
-version = "1.8.0"
+version = "1.9.0"
 description = "A zero-dependency Python module for inspecting and converting Claude Code session files (.jsonl) into the messages format expected by Hugging Face Transformers."
 readme = "README.md"
 requires-python = ">=3.8"

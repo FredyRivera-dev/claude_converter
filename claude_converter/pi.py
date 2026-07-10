@@ -12,6 +12,7 @@ from claude_converter.utils import (
     finalize_content,
     load_jsonl,
     merge_content_parts,
+    messages_to_json_safe,
     run_inspection,
 )
 
@@ -120,11 +121,21 @@ def _message_parts(record: dict) -> list[dict]:
     role = message.get("role", "")
 
     if role == "toolResult":
+        content = dlist(message, "content")
+        has_image = any(isinstance(b, dict) and b.get("type") == "image" for b in content)
+
+        if not has_image:
+            # No images inside: collapse to the exact same single text part
+            # _text_of produces, so text-only tool results stay byte-for-byte
+            # identical to the pre-multimodal output.
+            text = _text_of(record)
+            return [{"type": "text", "text": text}] if text.strip() else []
+
         tool_name = message.get("toolName", "")
         tool_id = message.get("toolCallId", "")
         parts: list[dict] = [{"type": "text", "text": f"<tool_result name='{tool_name}' id='{tool_id}'>"}]
 
-        for b in dlist(message, "content"):
+        for b in content:
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text" and b.get("text", "").strip():
@@ -193,6 +204,10 @@ def session_to_messages_pi(
 ) -> list[dict]:
     """
     Load a Pi session and convert it to the Transformers messages format.
+
+    output: if provided, saves the result as JSON. Image parts are
+    re-encoded as base64 data URIs for the saved file; the in-memory
+    list returned still has real PIL.Image objects.
     """
     records = load_session_pi(path)
     messages = records_to_messages_pi(records)
@@ -201,7 +216,7 @@ def session_to_messages_pi(
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         with open(output, "w", encoding="utf-8") as f:
-            json.dump(messages, f, ensure_ascii=False, indent=2)
+            json.dump(messages_to_json_safe(messages), f, ensure_ascii=False, indent=2)
 
     return messages
 

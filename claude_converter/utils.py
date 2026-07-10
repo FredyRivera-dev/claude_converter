@@ -104,6 +104,60 @@ def convert_base64_to_pil_image(uri: str):
         raise ValueError(f"Could not decode base64 image: {e}") from e
 
 
+def _pil_to_data_uri(image) -> str:
+    """Re-encode a PIL.Image back into a base64 data URI, for JSON dumps."""
+    fmt = (getattr(image, "format", None) or "PNG").upper()
+    buf = BytesIO()
+    try:
+        image.save(buf, format=fmt)
+    except Exception:
+        fmt = "PNG"
+        buf = BytesIO()
+        image.save(buf, format=fmt)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/{fmt.lower()};base64,{b64}"
+
+
+def messages_to_json_safe(messages: list[dict]) -> list[dict]:
+    """
+    Return a copy of `messages` safe to pass to json.dump(). Every
+    converter's records_to_messages_* can put a real PIL.Image object
+    inside a multimodal content part ({"type": "image", "image": ...}),
+    which json.dump cannot serialize on its own (raises
+    "TypeError: Object of type PngImageFile is not JSON serializable").
+
+    Only used for the on-disk `output=...` path: the in-memory list
+    returned to the caller keeps real PIL.Image objects untouched, since
+    that's what `transformers` processors expect when building tensors
+    directly. Images are re-encoded here as base64 data URIs under the
+    same "image" key `transformers` chat templates already recognize as
+    a base64 source. Confirmed directly against `transformers`' source
+    (image_utils.py, load_image()): it explicitly strips a "data:image/"
+    prefix up to the first comma before base64-decoding, so the
+    "data:image/png;base64,<b64>" string produced by _pil_to_data_uri is
+    exactly what load_image() expects — not a custom/guessed format.
+    """
+    def convert_content(content):
+        if not isinstance(content, list):
+            return content
+        converted = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image" and "image" in part:
+                image = part["image"]
+                try:
+                    from PIL import Image as PILImage
+                except ImportError:
+                    converted.append({"type": "image", "image": repr(image)})
+                    continue
+                if isinstance(image, PILImage.Image):
+                    converted.append({"type": "image", "image": _pil_to_data_uri(image)})
+                    continue
+            converted.append(part)
+        return converted
+
+    return [{**m, "content": convert_content(m.get("content"))} for m in messages]
+
+
 def merge_content_parts(existing: list[dict], new: list[dict]) -> None:
     """
     Extend `existing` in place with `new` multimodal content parts,

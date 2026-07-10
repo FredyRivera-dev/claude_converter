@@ -17,9 +17,11 @@ from .utils import (
     _hr,
     _truncate,
     convert_base64_to_pil_image,
+    dget,
     finalize_content,
     load_jsonl,
     merge_content_parts,
+    messages_to_json_safe,
     run_inspection,
 )
 
@@ -43,9 +45,15 @@ def _block_to_str(block: dict) -> str:
     if btype == "tool_result":
         content = block.get("content", "")
         if isinstance(content, list):
-            content = " ".join(
-                c.get("text", "") for c in content if c.get("type") == "text"
-            )
+            parts = []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "text":
+                    parts.append(c.get("text", ""))
+                elif c.get("type") == "image":
+                    parts.append("<image>")
+            content = " ".join(parts)
         return f"<tool_result>{content}</tool_result>"
 
     if btype == "image":
@@ -64,7 +72,7 @@ def _decode_claude_image(block: dict):
     source.data arrives as an empty string over remote control, and
     plain corrupted/undecodable base64.
     """
-    source = block.get("source", {})
+    source = dget(block, "source")
     if source.get("type") != "base64":
         print(f"X Skipping image with unsupported source type: {source.get('type')!r}", file=sys.stderr)
         return None
@@ -81,20 +89,55 @@ def _decode_claude_image(block: dict):
         return None
 
 
-def _block_to_parts(block: dict) -> dict | None:
+def _block_to_parts(block: dict) -> list[dict]:
     """
-    Like _block_to_str, but keeps an image block as a distinct multimodal
-    part {"type": "image", "image": PIL.Image} instead of flattening it
-    into text. Returns None for empty/unsupported/undecodable blocks.
+    Like _block_to_str, but keeps images as distinct multimodal parts
+    ({"type": "image", "image": PIL.Image}) instead of flattening them
+    into text.
+
+    Most block types contribute a single text part. "image" contributes
+    a single image part. "tool_result" can contribute *several* parts
+    (an opening tag, then each nested text/image piece, then a closing
+    tag) because Claude Code tool results routinely embed images
+    directly — e.g. the Read tool returning a .png file's contents.
     """
     btype = block.get("type", "")
 
     if btype == "image":
         image = _decode_claude_image(block)
-        return {"type": "image", "image": image} if image is not None else None
+        return [{"type": "image", "image": image}] if image is not None else []
+
+    if btype == "tool_result":
+        nested = block.get("content", "")
+        has_image = isinstance(nested, list) and any(
+            isinstance(nb, dict) and nb.get("type") == "image" for nb in nested
+        )
+
+        if not has_image:
+            # No nested images: collapse to the exact same single text part
+            # _block_to_str produces, so text-only tool results stay
+            # byte-for-byte identical to the pre-multimodal output.
+            text = _block_to_str(block)
+            return [{"type": "text", "text": text}] if text.strip() else []
+
+        tool_use_id = block.get("tool_use_id", "?")
+        parts: list[dict] = [{"type": "text", "text": f"<tool_result id='{tool_use_id}'>"}]
+        for nb in nested:
+            if not isinstance(nb, dict):
+                continue
+            if nb.get("type") == "image":
+                image = _decode_claude_image(nb)
+                if image is not None:
+                    parts.append({"type": "image", "image": image})
+            elif nb.get("type") == "text":
+                text = nb.get("text", "")
+                if text.strip():
+                    parts.append({"type": "text", "text": text})
+        parts.append({"type": "text", "text": "</tool_result>"})
+        return parts
 
     text = _block_to_str(block)
-    return {"type": "text", "text": text} if text.strip() else None
+    return [{"type": "text", "text": text}] if text.strip() else []
 
 
 def _content_to_str(content: str | list | None) -> str:
@@ -117,8 +160,11 @@ def _content_to_parts(content: str | list | None) -> list[dict]:
     if isinstance(content, str):
         return [{"type": "text", "text": content}] if content.strip() else []
     if isinstance(content, list):
-        parts = [_block_to_parts(b) for b in content if isinstance(b, dict)]
-        return [p for p in parts if p is not None]
+        parts: list[dict] = []
+        for b in content:
+            if isinstance(b, dict):
+                parts.extend(_block_to_parts(b))
+        return parts
     return []
 
 
@@ -148,14 +194,23 @@ def _render_block(block: dict, indent: str = "       ") -> str:
         lines.append(f"{indent}  input: {inp}")
 
     elif btype == "tool_result":
-        content = block.get("content", "")
-        if isinstance(content, list):
-            content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+        nested = block.get("content", "")
         lines.append(f"{indent}{_c('tool_result', cf)}: [{_c(block.get('tool_use_id', '?'), DIM)}]")
-        lines.append(f"{indent}  content: {_truncate(str(content), 120)}")
+        if isinstance(nested, list):
+            for nb in nested:
+                if not isinstance(nb, dict):
+                    continue
+                if nb.get("type") == "image":
+                    src = dget(nb, "source")
+                    data_len = len(src.get("data", "") or "")
+                    lines.append(f"{indent}  image: {src.get('media_type', '?')} ({data_len} base64 chars)")
+                elif nb.get("type") == "text":
+                    lines.append(f"{indent}  content: {_truncate(nb.get('text', ''), 120)}")
+        else:
+            lines.append(f"{indent}  content: {_truncate(str(nested), 120)}")
 
     elif btype == "image":
-        source = block.get("source", {})
+        source = dget(block, "source")
         data_len = len(source.get("data", "") or "")
         lines.append(f"{indent}{_c('image', cf)}: {source.get('media_type', '?')} ({data_len} base64 chars)")
 
@@ -210,7 +265,7 @@ def records_to_messages(records: list[dict]) -> list[dict]:
         if rtype not in ("user", "assistant"):
             continue
 
-        msg = record.get("message", {})
+        msg = dget(record, "message")
         role = msg.get("role", rtype)
         parts = _content_to_parts(msg.get("content", ""))
 
@@ -234,7 +289,10 @@ def session_to_messages(
 
     Args:
         path:   Path to the .jsonl session file.
-        output: If provided, saves the result as JSON to this path.
+        output: If provided, saves the result as JSON to this path. Any
+                image parts are re-encoded as base64 data URIs for the
+                saved file (see messages_to_json_safe); the in-memory
+                list returned still has real PIL.Image objects.
 
     Returns:
         List of dicts {"role": ..., "content": ...} ready for apply_chat_template().
@@ -245,6 +303,14 @@ def session_to_messages(
     """
     records = load_session(path)
     messages = records_to_messages(records)
+
+    if output is not None:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with open(output, "w", encoding="utf-8") as f:
+            json.dump(messages_to_json_safe(messages), f, ensure_ascii=False, indent=2)
+
+    return messages
 
     if output is not None:
         output = Path(output)
@@ -266,11 +332,11 @@ def _is_message(r: dict) -> bool:
 
 
 def _role_of(r: dict) -> str:
-    return r.get("message", {}).get("role", r.get("type", "unknown"))
+    return dget(r, "message").get("role", r.get("type", "unknown"))
 
 
 def _text_of(r: dict) -> str:
-    return _content_to_str(r.get("message", {}).get("content", ""))
+    return _content_to_str(dget(r, "message").get("content", ""))
 
 
 def _timestamp_of(r: dict) -> str:
@@ -278,15 +344,15 @@ def _timestamp_of(r: dict) -> str:
 
 
 def _tokens_of(r: dict) -> int:
-    return r.get("message", {}).get("usage", {}).get("output_tokens", 0)
+    return dget(dget(r, "message"), "usage").get("output_tokens", 0)
 
 
 def _block_types_of(r: dict) -> list[str]:
-    return _collect_block_types(r.get("message", {}).get("content", []))
+    return _collect_block_types(dget(r, "message").get("content", []))
 
 
 def _blocks_of(r: dict) -> list[dict]:
-    content = r.get("message", {}).get("content", [])
+    content = dget(r, "message").get("content", [])
     return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
 
 
@@ -294,7 +360,7 @@ def _total_tokens_of(records: list[dict]) -> dict[str, int]:
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
 
     for r in records:
-        u = r.get("message", {}).get("usage", {})
+        u = dget(dget(r, "message"), "usage")
         totals["input"] += u.get("input_tokens", 0)
         totals["output"] += u.get("output_tokens", 0)
         totals["cache_read"] += u.get("cache_read_input_tokens", 0)

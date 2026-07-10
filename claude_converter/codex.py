@@ -12,6 +12,7 @@ from claude_converter.utils import (
     finalize_content,
     load_jsonl,
     merge_content_parts,
+    messages_to_json_safe,
     run_inspection,
 )
 
@@ -178,6 +179,10 @@ def session_to_messages_codex(
 ) -> list[dict]:
     """
     Load a Codex session and convert it to the Transformers messages format.
+
+    output: if provided, saves the result as JSON. Image parts are
+    re-encoded as base64 data URIs for the saved file; the in-memory
+    list returned still has real PIL.Image objects.
     """
     records = load_session_codex(path)
     messages = records_to_messages_codex(records)
@@ -186,7 +191,7 @@ def session_to_messages_codex(
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         with open(output, "w", encoding="utf-8") as f:
-            json.dump(messages, f, ensure_ascii=False, indent=2)
+            json.dump(messages_to_json_safe(messages), f, ensure_ascii=False, indent=2)
 
     return messages
 
